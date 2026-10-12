@@ -1,0 +1,182 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Análisis de sentimientos con Transformers\n",
+    "Ejecuta las celdas en orden. La GPU ayuda con archivos grandes (Entorno de ejecución > Cambiar tipo de entorno > T4), pero también funciona en CPU."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "!pip -q install gradio transformers"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Backend: modelos y funciones"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import torch, pandas as pd\n",
+    "from transformers import pipeline\n",
+    "\n",
+    "device = 0 if torch.cuda.is_available() else -1\n",
+    "\n",
+    "MODELOS = {\n",
+    "    \"Multilingüe 3 clases (XLM-RoBERTa)\": \"cardiffnlp/twitter-xlm-roberta-base-sentiment\",\n",
+    "    \"Multilingüe 1-5 estrellas (BERT)\": \"nlptown/bert-base-multilingual-uncased-sentiment\",\n",
+    "}\n",
+    "MAX_FILAS = 500\n",
+    "_pipes = {}\n",
+    "\n",
+    "def get_pipe(nombre):\n",
+    "    if nombre not in _pipes:\n",
+    "        _pipes[nombre] = pipeline(\"text-classification\", model=MODELOS[nombre], device=device)\n",
+    "    return _pipes[nombre]\n",
+    "\n",
+    "def analizar_texto(texto, modelo):\n",
+    "    if not texto or not texto.strip():\n",
+    "        return {}, \"Escribe un texto.\"\n",
+    "    res = get_pipe(modelo)(texto, top_k=None, truncation=True)\n",
+    "    if res and isinstance(res[0], list):\n",
+    "        res = res[0]\n",
+    "    scores = {r[\"label\"]: float(r[\"score\"]) for r in res}\n",
+    "    mejor = max(scores, key=scores.get)\n",
+    "    return scores, f\"Predicción: {mejor} ({scores[mejor]:.1%})\"\n",
+    "\n",
+    "def leer_textos(ruta):\n",
+    "    if ruta.lower().endswith(\".csv\"):\n",
+    "        df = pd.read_csv(ruta)\n",
+    "        col = next((c for c in df.columns if str(c).lower() in (\"texto\", \"text\", \"comentario\", \"review\")), None)\n",
+    "        if col is None:\n",
+    "            col = next((c for c in df.columns if pd.api.types.is_string_dtype(df[c])), None)\n",
+    "        if col is None:\n",
+    "            raise ValueError(\"El CSV no tiene una columna de texto.\")\n",
+    "        return df[col].dropna().astype(str).tolist()\n",
+    "    with open(ruta, encoding=\"utf-8\", errors=\"ignore\") as f:\n",
+    "        return [l.strip() for l in f if l.strip()]\n",
+    "\n",
+    "def analizar_archivo(ruta, modelo):\n",
+    "    if ruta is None:\n",
+    "        return \"Sube un archivo .txt o .csv.\", None, None\n",
+    "    try:\n",
+    "        todos = leer_textos(ruta)\n",
+    "        textos = todos[:MAX_FILAS]\n",
+    "        if not textos:\n",
+    "            return \"El archivo no tiene texto.\", None, None\n",
+    "        res = get_pipe(modelo)(textos, batch_size=16, truncation=True)\n",
+    "    except Exception as e:\n",
+    "        return f\"Error: {e}\", None, None\n",
+    "    df = pd.DataFrame({\n",
+    "        \"texto\": textos,\n",
+    "        \"sentimiento\": [r[\"label\"] for r in res],\n",
+    "        \"confianza\": [round(r[\"score\"], 3) for r in res],\n",
+    "    })\n",
+    "    resumen = \"\\n\".join(f\"{k}: {v} ({v / len(df):.0%})\" for k, v in df[\"sentimiento\"].value_counts().items())\n",
+    "    resumen = f\"Textos analizados: {len(df)}\\n\" + resumen\n",
+    "    if len(todos) > MAX_FILAS:\n",
+    "        resumen += f\"\\n(Se analizaron solo los primeros {MAX_FILAS} de {len(todos)} textos.)\"\n",
+    "    df.to_csv(\"resultados_sentimiento.csv\", index=False)\n",
+    "    return resumen, df, \"resultados_sentimiento.csv\"\n",
+    "\n",
+    "def info_modelo(modelo):\n",
+    "    p = get_pipe(modelo)\n",
+    "    params = sum(x.numel() for x in p.model.parameters())\n",
+    "    return (f\"Modelo: {MODELOS[modelo]}\\n\"\n",
+    "            f\"Etiquetas: {list(p.model.config.id2label.values())}\\n\"\n",
+    "            f\"Parámetros: {params:,}\\n\"\n",
+    "            f\"Dispositivo: {'GPU' if device == 0 else 'CPU'}\\n\"\n",
+    "            f\"Límite por archivo: {MAX_FILAS} textos\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Archivo de ejemplo (opcional, para probar la carga)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "pd.DataFrame({\"texto\": [\n",
+    "    \"Me encantó el producto, llegó rápido y funciona perfecto.\",\n",
+    "    \"Pésimo servicio, nadie me respondió y perdí mi dinero.\",\n",
+    "    \"El envío llegó el martes.\",\n",
+    "    \"The movie was fantastic, I would watch it again!\",\n",
+    "    \"I am really disappointed with the quality.\",\n",
+    "]}).to_csv(\"comentarios_ejemplo.csv\", index=False)\n",
+    "print(\"Creado: comentarios_ejemplo.csv (descárgalo desde el panel de archivos para subirlo en la interfaz)\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Interfaz (Gradio)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import gradio as gr\n",
+    "\n",
+    "with gr.Blocks(title=\"Análisis de sentimientos\") as demo:\n",
+    "    gr.Markdown(\"# Análisis de sentimientos con Transformers\")\n",
+    "    modelo = gr.Dropdown(list(MODELOS), value=list(MODELOS)[0], label=\"Modelo\")\n",
+    "    with gr.Tabs():\n",
+    "        with gr.TabItem(\"Texto\"):\n",
+    "            t_in = gr.Textbox(label=\"Escribe o pega un texto\", lines=5)\n",
+    "            t_btn = gr.Button(\"Analizar\", variant=\"primary\")\n",
+    "            t_lab = gr.Label(label=\"Probabilidades\", num_top_classes=5)\n",
+    "            t_txt = gr.Textbox(label=\"Resultado\")\n",
+    "            t_btn.click(analizar_texto, [t_in, modelo], [t_lab, t_txt])\n",
+    "        with gr.TabItem(\"Archivo\"):\n",
+    "            gr.Markdown(\"Sube un **.txt** (un texto por línea) o un **.csv** (columna de texto).\")\n",
+    "            f_in = gr.File(file_types=[\".txt\", \".csv\"], type=\"filepath\", label=\"Archivo\")\n",
+    "            f_btn = gr.Button(\"Analizar archivo\", variant=\"primary\")\n",
+    "            f_res = gr.Textbox(label=\"Resumen\", lines=5)\n",
+    "            f_df = gr.Dataframe(label=\"Resultados\")\n",
+    "            f_out = gr.File(label=\"Descargar resultados (CSV)\")\n",
+    "            f_btn.click(analizar_archivo, [f_in, modelo], [f_res, f_df, f_out])\n",
+    "        with gr.TabItem(\"Información del modelo\"):\n",
+    "            i_btn = gr.Button(\"Ver información\")\n",
+    "            i_out = gr.Textbox(label=\"Detalles\", lines=6)\n",
+    "            i_btn.click(info_modelo, modelo, i_out)\n",
+    "\n",
+    "demo.launch(share=True, debug=True)"
+   ]
+  }
+ ],
+ "metadata": {
+  "accelerator": "GPU",
+  "colab": {
+   "provenance": []
+  },
+  "kernelspec": {
+   "name": "python3",
+   "display_name": "Python 3"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

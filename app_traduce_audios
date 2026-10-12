@@ -1,0 +1,264 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Procesamiento de audios de comentarios de productos\n",
+    "1. Crea la base de datos (SQLite) con la tabla de comentarios (producto, likes, dislikes, cliente).\n",
+    "2. Procesa audios de comentarios (transcripción + sentimiento + características del sonido) y guarda el análisis en la base de datos.\n",
+    "\n",
+    "Ejecuta las celdas en orden. Conviene activar GPU (Entorno de ejecución > Cambiar tipo de entorno > T4)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "!pip -q install openai-whisper gradio transformers gTTS"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## a. Base de datos y tabla de comentarios"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import sqlite3\n",
+    "import pandas as pd\n",
+    "\n",
+    "DB = \"comentarios.db\"\n",
+    "\n",
+    "# Datos de ejemplo (producto, likes, dislikes, cliente)\n",
+    "EJEMPLOS = [\n",
+    "    (\"Auriculares Bluetooth X1\", 1, 0, \"Ana Pérez\"),\n",
+    "    (\"Auriculares Bluetooth X1\", 0, 1, \"Luis Gómez\"),\n",
+    "    (\"Licuadora Turbo 500\", 1, 0, \"María López\"),\n",
+    "    (\"Licuadora Turbo 500\", 1, 0, \"Carlos Ruiz\"),\n",
+    "    (\"Zapatillas Runner Pro\", 0, 1, \"Sofía Díaz\"),\n",
+    "    (\"Zapatillas Runner Pro\", 1, 0, \"Jorge Silva\"),\n",
+    "]\n",
+    "\n",
+    "def conectar():\n",
+    "    return sqlite3.connect(DB)\n",
+    "\n",
+    "def crear_tablas():\n",
+    "    with conectar() as con:\n",
+    "        con.execute('''CREATE TABLE IF NOT EXISTS comentarios (\n",
+    "            id INTEGER PRIMARY KEY AUTOINCREMENT,\n",
+    "            producto TEXT NOT NULL,\n",
+    "            likes INTEGER NOT NULL DEFAULT 0,\n",
+    "            dislikes INTEGER NOT NULL DEFAULT 0,\n",
+    "            cliente TEXT NOT NULL)''')\n",
+    "        con.execute('''CREATE TABLE IF NOT EXISTS analisis_audios (\n",
+    "            id INTEGER PRIMARY KEY AUTOINCREMENT,\n",
+    "            comentario_id INTEGER REFERENCES comentarios(id),\n",
+    "            archivo TEXT,\n",
+    "            fecha TEXT,\n",
+    "            duracion_seg REAL,\n",
+    "            nivel_volumen_db REAL,\n",
+    "            idioma TEXT,\n",
+    "            transcripcion TEXT,\n",
+    "            sentimiento TEXT,\n",
+    "            confianza REAL)''')\n",
+    "        if con.execute(\"SELECT COUNT(*) FROM comentarios\").fetchone()[0] == 0:\n",
+    "            con.executemany(\"INSERT INTO comentarios (producto, likes, dislikes, cliente) VALUES (?,?,?,?)\", EJEMPLOS)\n",
+    "\n",
+    "crear_tablas()\n",
+    "with conectar() as con:\n",
+    "    display(pd.read_sql_query(\"SELECT * FROM comentarios\", con))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## b. Modelos y procesamiento de audio"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import os, json, shutil, datetime\n",
+    "import numpy as np\n",
+    "import torch, whisper\n",
+    "from transformers import pipeline\n",
+    "\n",
+    "dev_str = \"cuda\" if torch.cuda.is_available() else \"cpu\"\n",
+    "dev_idx = 0 if dev_str == \"cuda\" else -1\n",
+    "\n",
+    "modelo_whisper = whisper.load_model(\"small\", device=dev_str)\n",
+    "clasificador = pipeline(\"text-classification\", model=\"cardiffnlp/twitter-xlm-roberta-base-sentiment\", device=dev_idx)\n",
+    "\n",
+    "MAPA = {\"positive\": \"positivo\", \"negative\": \"negativo\", \"neutral\": \"neutro\",\n",
+    "        \"label_0\": \"negativo\", \"label_1\": \"neutro\", \"label_2\": \"positivo\"}\n",
+    "\n",
+    "def transcribir_audio(ruta):\n",
+    "    r = modelo_whisper.transcribe(ruta, fp16=(dev_str == \"cuda\"))\n",
+    "    return r[\"text\"].strip(), r[\"language\"]\n",
+    "\n",
+    "def clasificar_sentimiento(texto):\n",
+    "    r = clasificador(texto, truncation=True)[0]\n",
+    "    etiqueta = r[\"label\"].lower()\n",
+    "    return MAPA.get(etiqueta, etiqueta), float(r[\"score\"])\n",
+    "\n",
+    "def caracteristicas_audio(ruta):\n",
+    "    audio = whisper.load_audio(ruta)          # mono, 16 kHz, valores entre -1 y 1\n",
+    "    duracion = round(len(audio) / 16000, 2)\n",
+    "    rms = float(np.sqrt(np.mean(audio ** 2)))\n",
+    "    nivel_db = round(20 * np.log10(rms + 1e-9), 1)\n",
+    "    return duracion, nivel_db\n",
+    "\n",
+    "os.makedirs(\"audios\", exist_ok=True)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "def procesar_audio(ruta, producto, cliente):\n",
+    "    producto, cliente = (producto or \"\").strip(), (cliente or \"\").strip()\n",
+    "    if not producto or not cliente:\n",
+    "        raise ValueError(\"Indica el producto y el cliente.\")\n",
+    "    texto, idioma = transcribir_audio(ruta)\n",
+    "    if not texto:\n",
+    "        raise ValueError(\"No se detectó voz en el audio.\")\n",
+    "    sentimiento, confianza = clasificar_sentimiento(texto)\n",
+    "    duracion, nivel_db = caracteristicas_audio(ruta)\n",
+    "\n",
+    "    like = 1 if sentimiento == \"positivo\" else 0\n",
+    "    dislike = 1 if sentimiento == \"negativo\" else 0\n",
+    "\n",
+    "    ahora = datetime.datetime.now()\n",
+    "    destino = os.path.join(\"audios\", f\"{ahora:%Y%m%d_%H%M%S}_{os.path.basename(ruta)}\")\n",
+    "    shutil.copy(ruta, destino)\n",
+    "\n",
+    "    with conectar() as con:\n",
+    "        cur = con.execute(\"INSERT INTO comentarios (producto, likes, dislikes, cliente) VALUES (?,?,?,?)\",\n",
+    "                          (producto, like, dislike, cliente))\n",
+    "        cid = cur.lastrowid\n",
+    "        con.execute(\n",
+    "            \"INSERT INTO analisis_audios (comentario_id, archivo, fecha, duracion_seg, nivel_volumen_db, \"\n",
+    "            \"idioma, transcripcion, sentimiento, confianza) VALUES (?,?,?,?,?,?,?,?,?)\",\n",
+    "            (cid, destino, ahora.isoformat(timespec=\"seconds\"), duracion, nivel_db,\n",
+    "             idioma, texto, sentimiento, confianza))\n",
+    "\n",
+    "    resumen = (f\"Sentimiento: {sentimiento} ({confianza:.1%}) -> \"\n",
+    "               f\"{'LIKE' if like else 'DISLIKE' if dislike else 'sin like ni dislike'}\\n\"\n",
+    "               f\"Idioma: {idioma} | Duración: {duracion} s | Volumen: {nivel_db} dB\\n\"\n",
+    "               f\"Guardado en la base de datos (comentario #{cid}).\")\n",
+    "    return texto, resumen"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Audios de prueba (opcional)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "from gtts import gTTS\n",
+    "gTTS(\"Me encantó la licuadora, es potente y muy fácil de limpiar. La recomiendo.\", lang=\"es\").save(\"comentario_positivo.mp3\")\n",
+    "gTTS(\"Muy mala experiencia, el producto llegó roto y nadie me ayudó.\", lang=\"es\").save(\"comentario_negativo.mp3\")\n",
+    "print(\"Creados: comentario_positivo.mp3 y comentario_negativo.mp3 (descárgalos del panel de archivos para subirlos en la interfaz)\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## c. Interfaz (Gradio)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import gradio as gr\n",
+    "\n",
+    "def ui_procesar(ruta, producto, cliente):\n",
+    "    if ruta is None:\n",
+    "        return \"\", \"Sube o graba un audio.\"\n",
+    "    try:\n",
+    "        return procesar_audio(ruta, producto, cliente)\n",
+    "    except Exception as e:\n",
+    "        return \"\", f\"Error: {e}\"\n",
+    "\n",
+    "def ver_tablas():\n",
+    "    with conectar() as con:\n",
+    "        c = pd.read_sql_query(\"SELECT * FROM comentarios ORDER BY id DESC\", con)\n",
+    "        a = pd.read_sql_query(\"SELECT * FROM analisis_audios ORDER BY id DESC\", con)\n",
+    "        r = pd.read_sql_query('''SELECT producto, COUNT(*) AS comentarios, SUM(likes) AS likes, SUM(dislikes) AS dislikes\n",
+    "                                 FROM comentarios GROUP BY producto ORDER BY comentarios DESC''', con)\n",
+    "    return c, a, r\n",
+    "\n",
+    "with gr.Blocks(title=\"Comentarios de productos en audio\") as demo:\n",
+    "    gr.Markdown(\"# Análisis de comentarios de productos en audio\")\n",
+    "    with gr.Tabs():\n",
+    "        with gr.TabItem(\"Analizar audio\"):\n",
+    "            producto = gr.Textbox(label=\"Producto\")\n",
+    "            cliente = gr.Textbox(label=\"Cliente\")\n",
+    "            audio = gr.Audio(sources=[\"upload\", \"microphone\"], type=\"filepath\", label=\"Audio del comentario\")\n",
+    "            btn = gr.Button(\"Analizar y guardar\", variant=\"primary\")\n",
+    "            transc = gr.Textbox(label=\"Transcripción\", lines=4)\n",
+    "            resumen = gr.Textbox(label=\"Análisis\", lines=4)\n",
+    "            btn.click(ui_procesar, [audio, producto, cliente], [transc, resumen])\n",
+    "        with gr.TabItem(\"Base de datos\"):\n",
+    "            b = gr.Button(\"Actualizar tablas\")\n",
+    "            t_c = gr.Dataframe(label=\"Tabla: comentarios\")\n",
+    "            t_a = gr.Dataframe(label=\"Tabla: analisis_audios\")\n",
+    "            t_r = gr.Dataframe(label=\"Resumen por producto\")\n",
+    "            b.click(ver_tablas, None, [t_c, t_a, t_r])\n",
+    "\n",
+    "demo.launch(share=True, debug=True)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Guardar la base de datos\n",
+    "En Colab los archivos se borran al cerrar la sesión. Descarga `comentarios.db` y la carpeta `audios/`, o móntalos en Google Drive:\n",
+    "```python\n",
+    "from google.colab import drive\n",
+    "drive.mount('/content/drive')\n",
+    "```\n",
+    "y cambia `DB = \"comentarios.db\"` por una ruta dentro de Drive."
+   ]
+  }
+ ],
+ "metadata": {
+  "accelerator": "GPU",
+  "colab": {
+   "provenance": []
+  },
+  "kernelspec": {
+   "name": "python3",
+   "display_name": "Python 3"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

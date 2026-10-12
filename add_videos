@@ -1,0 +1,299 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Procesamiento de videos\n",
+    "1. Crea la base de datos (SQLite) con la tabla de videos (nombre de archivo y resumen).\n",
+    "2. Procesa videos (transcribe el audio, genera un resumen y analiza las imágenes) y guarda el análisis en la base de datos.\n",
+    "\n",
+    "Ejecuta las celdas en orden. Conviene activar GPU (Entorno de ejecución > Cambiar tipo de entorno > T4)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "!pip -q install openai-whisper gradio gTTS"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## a. Base de datos y tabla de videos"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import sqlite3\n",
+    "import pandas as pd\n",
+    "\n",
+    "DB = \"videos.db\"\n",
+    "\n",
+    "def conectar():\n",
+    "    return sqlite3.connect(DB)\n",
+    "\n",
+    "def crear_tablas():\n",
+    "    with conectar() as con:\n",
+    "        con.execute('''CREATE TABLE IF NOT EXISTS videos (\n",
+    "            id INTEGER PRIMARY KEY AUTOINCREMENT,\n",
+    "            nombre_archivo TEXT NOT NULL,\n",
+    "            resumen TEXT)''')\n",
+    "        con.execute('''CREATE TABLE IF NOT EXISTS analisis_videos (\n",
+    "            id INTEGER PRIMARY KEY AUTOINCREMENT,\n",
+    "            video_id INTEGER REFERENCES videos(id),\n",
+    "            fecha TEXT,\n",
+    "            duracion_seg REAL,\n",
+    "            fps REAL,\n",
+    "            ancho INTEGER,\n",
+    "            alto INTEGER,\n",
+    "            brillo_promedio REAL,\n",
+    "            cambios_escena INTEGER,\n",
+    "            idioma TEXT,\n",
+    "            transcripcion TEXT,\n",
+    "            palabras_clave TEXT,\n",
+    "            miniatura TEXT)''')\n",
+    "\n",
+    "crear_tablas()\n",
+    "print(\"Tablas creadas: videos y analisis_videos\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## b. Procesamiento de videos"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import os, re, shutil, datetime\n",
+    "from collections import Counter\n",
+    "import cv2\n",
+    "import numpy as np\n",
+    "import torch, whisper\n",
+    "\n",
+    "dev_str = \"cuda\" if torch.cuda.is_available() else \"cpu\"\n",
+    "modelo_whisper = whisper.load_model(\"small\", device=dev_str)\n",
+    "\n",
+    "for carpeta in (\"videos\", \"miniaturas\"):\n",
+    "    os.makedirs(carpeta, exist_ok=True)\n",
+    "\n",
+    "STOPWORDS = set('''de la que el en y a los del se las por un para con no una su al lo como más pero sus le ya o este\n",
+    "sí porque esta entre cuando muy sin sobre también me hasta hay donde quien desde todo nos durante todos uno les ni\n",
+    "contra otros ese eso ante ellos e esto mí antes algunos qué unos yo otro otras otra él tanto esa estos mucho quienes\n",
+    "nada muchos cual poco ella estar estas algunas algo nosotros mi mis tú te ti tu tus es son fue era soy lo he ha han\n",
+    "the and was is it to of for with this that are i my have not but you very from which their been has can will'''.split())\n",
+    "\n",
+    "def palabras_utiles(texto):\n",
+    "    return [p for p in re.findall(r\"[a-záéíóúñü]+\", texto.lower()) if len(p) > 3 and p not in STOPWORDS]\n",
+    "\n",
+    "def resumir(texto, n=3):\n",
+    "    texto = re.sub(r\"\\s+\", \" \", texto).strip()\n",
+    "    oraciones = [o.strip() for o in re.split(r\"(?<=[.!?])\\s+\", texto) if len(o.strip()) >= 25]\n",
+    "    if not oraciones:\n",
+    "        return texto[:300]\n",
+    "    if len(oraciones) <= n:\n",
+    "        return \" \".join(oraciones)\n",
+    "    freq = Counter(palabras_utiles(texto))\n",
+    "    def puntaje(o):\n",
+    "        ps = palabras_utiles(o)\n",
+    "        return sum(freq[p] for p in ps) / (len(ps) + 1)\n",
+    "    mejores = sorted(sorted(range(len(oraciones)), key=lambda i: puntaje(oraciones[i]), reverse=True)[:n])\n",
+    "    return \" \".join(oraciones[i] for i in mejores)\n",
+    "\n",
+    "def transcribir_audio(ruta):\n",
+    "    r = modelo_whisper.transcribe(ruta, fp16=(dev_str == \"cuda\"))\n",
+    "    return r[\"text\"].strip(), r[\"language\"]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "def analizar_imagenes(ruta, nombre):\n",
+    "    cap = cv2.VideoCapture(ruta)\n",
+    "    if not cap.isOpened():\n",
+    "        raise ValueError(\"No se pudo abrir el video.\")\n",
+    "    fps = cap.get(cv2.CAP_PROP_FPS) or 0\n",
+    "    ancho = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))\n",
+    "    alto = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))\n",
+    "    paso = max(int(round(fps)), 1)            # un fotograma muestreado por segundo\n",
+    "    brillos, cambios, previo, miniatura, idx = [], 0, None, None, 0\n",
+    "    while cap.grab():\n",
+    "        if idx % paso == 0:\n",
+    "            ok, frame = cap.retrieve()\n",
+    "            if ok:\n",
+    "                gris = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (64, 36)).astype(float)\n",
+    "                brillos.append(float(gris.mean()))\n",
+    "                if previo is not None and np.abs(gris - previo).mean() > 30:\n",
+    "                    cambios += 1\n",
+    "                previo = gris\n",
+    "                if miniatura is None:\n",
+    "                    miniatura = frame\n",
+    "        idx += 1\n",
+    "    cap.release()\n",
+    "    if idx == 0:\n",
+    "        raise ValueError(\"El video no tiene fotogramas.\")\n",
+    "    ruta_min = \"\"\n",
+    "    if miniatura is not None:\n",
+    "        ruta_min = os.path.join(\"miniaturas\", os.path.splitext(nombre)[0] + \".jpg\")\n",
+    "        cv2.imwrite(ruta_min, miniatura)\n",
+    "    duracion = round(idx / fps, 2) if fps else 0.0\n",
+    "    return {\"duracion\": duracion, \"fps\": round(fps, 2), \"ancho\": ancho, \"alto\": alto,\n",
+    "            \"brillo\": round(float(np.mean(brillos)), 1) if brillos else 0.0,\n",
+    "            \"cambios\": cambios, \"miniatura\": ruta_min}\n",
+    "\n",
+    "def procesar_video(ruta):\n",
+    "    nombre = os.path.basename(ruta)\n",
+    "    vis = analizar_imagenes(ruta, nombre)\n",
+    "    try:\n",
+    "        texto, idioma = transcribir_audio(ruta)\n",
+    "    except Exception:\n",
+    "        texto, idioma = \"\", \"\"                 # video sin pista de audio\n",
+    "    if texto:\n",
+    "        resumen = resumir(texto)\n",
+    "        claves = \", \".join(p for p, _ in Counter(palabras_utiles(texto)).most_common(8))\n",
+    "    else:\n",
+    "        resumen, claves = \"No se detectó voz en el video.\", \"\"\n",
+    "    shutil.copy(ruta, os.path.join(\"videos\", nombre))\n",
+    "    ahora = datetime.datetime.now().isoformat(timespec=\"seconds\")\n",
+    "    with conectar() as con:\n",
+    "        cur = con.execute(\"INSERT INTO videos (nombre_archivo, resumen) VALUES (?,?)\", (nombre, resumen))\n",
+    "        con.execute(\n",
+    "            \"INSERT INTO analisis_videos (video_id, fecha, duracion_seg, fps, ancho, alto, brillo_promedio, \"\n",
+    "            \"cambios_escena, idioma, transcripcion, palabras_clave, miniatura) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)\",\n",
+    "            (cur.lastrowid, ahora, vis[\"duracion\"], vis[\"fps\"], vis[\"ancho\"], vis[\"alto\"], vis[\"brillo\"],\n",
+    "             vis[\"cambios\"], idioma, texto, claves, vis[\"miniatura\"]))\n",
+    "    return {\"archivo\": nombre, \"duracion\": vis[\"duracion\"], \"resolucion\": f\"{vis['ancho']}x{vis['alto']}\",\n",
+    "            \"cambios\": vis[\"cambios\"], \"brillo\": vis[\"brillo\"], \"idioma\": idioma,\n",
+    "            \"palabras_clave\": claves, \"resumen\": resumen, \"miniatura\": vis[\"miniatura\"]}"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Video de prueba (opcional)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import subprocess\n",
+    "from gtts import gTTS\n",
+    "\n",
+    "gTTS(\"Hoy les presento el nuevo robot de cocina. Corta, mezcla y cocina los alimentos de forma automática. \"\n",
+    "     \"Tiene una pantalla táctil muy fácil de usar. El robot de cocina ahorra mucho tiempo en la preparación de las comidas. \"\n",
+    "     \"Además, es silencioso y fácil de limpiar.\", lang=\"es\").save(\"narracion.mp3\")\n",
+    "subprocess.run([\"ffmpeg\", \"-y\", \"-loglevel\", \"error\", \"-f\", \"lavfi\", \"-i\", \"color=c=0x2060a0:s=640x360:r=24\",\n",
+    "                \"-i\", \"narracion.mp3\", \"-c:v\", \"libx264\", \"-pix_fmt\", \"yuv420p\", \"-c:a\", \"aac\", \"-shortest\",\n",
+    "                \"video_prueba.mp4\"], check=True)\n",
+    "print(\"Creado: video_prueba.mp4 (descárgalo del panel de archivos para subirlo en la interfaz)\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## c. Interfaz (Gradio)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import gradio as gr\n",
+    "\n",
+    "def ui_procesar(rutas):\n",
+    "    if not rutas:\n",
+    "        return pd.DataFrame(), \"Sube uno o más videos.\", None\n",
+    "    if isinstance(rutas, str):\n",
+    "        rutas = [rutas]\n",
+    "    filas, errores, ultima = [], [], None\n",
+    "    for r in rutas:\n",
+    "        try:\n",
+    "            res = procesar_video(r)\n",
+    "            filas.append({\"Archivo\": res[\"archivo\"], \"Duración (s)\": res[\"duracion\"], \"Resolución\": res[\"resolucion\"],\n",
+    "                          \"Cambios de escena\": res[\"cambios\"], \"Idioma\": res[\"idioma\"],\n",
+    "                          \"Palabras clave\": res[\"palabras_clave\"], \"Resumen\": res[\"resumen\"]})\n",
+    "            ultima = res[\"miniatura\"] or ultima\n",
+    "        except Exception as e:\n",
+    "            errores.append(f\"{os.path.basename(r)}: {e}\")\n",
+    "    estado = f\"Videos procesados y guardados: {len(filas)} de {len(rutas)}.\"\n",
+    "    if errores:\n",
+    "        estado += \"\\nErrores:\\n\" + \"\\n\".join(errores)\n",
+    "    return pd.DataFrame(filas), estado, ultima\n",
+    "\n",
+    "def ver_tablas():\n",
+    "    with conectar() as con:\n",
+    "        v = pd.read_sql_query(\"SELECT * FROM videos ORDER BY id DESC\", con)\n",
+    "        a = pd.read_sql_query(\"SELECT * FROM analisis_videos ORDER BY id DESC\", con)\n",
+    "    return v, a\n",
+    "\n",
+    "with gr.Blocks(title=\"Procesamiento de videos\") as demo:\n",
+    "    gr.Markdown(\"# Procesamiento de videos: resumen y análisis\")\n",
+    "    with gr.Tabs():\n",
+    "        with gr.TabItem(\"Procesar video\"):\n",
+    "            archivos = gr.File(file_count=\"multiple\", file_types=[\".mp4\", \".mov\", \".avi\", \".mkv\", \".webm\"],\n",
+    "                               type=\"filepath\", label=\"Videos\")\n",
+    "            btn = gr.Button(\"Procesar y guardar\", variant=\"primary\")\n",
+    "            estado = gr.Textbox(label=\"Estado\", lines=3)\n",
+    "            tabla = gr.Dataframe(label=\"Resultados\")\n",
+    "            mini = gr.Image(label=\"Miniatura (último video)\", type=\"filepath\")\n",
+    "            btn.click(ui_procesar, archivos, [tabla, estado, mini])\n",
+    "        with gr.TabItem(\"Base de datos\"):\n",
+    "            b = gr.Button(\"Actualizar tablas\")\n",
+    "            t_v = gr.Dataframe(label=\"Tabla: videos\")\n",
+    "            t_a = gr.Dataframe(label=\"Tabla: analisis_videos\")\n",
+    "            b.click(ver_tablas, None, [t_v, t_a])\n",
+    "\n",
+    "demo.launch(share=True, debug=True)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Guardar la base de datos\n",
+    "En Colab los archivos se borran al cerrar la sesión. Descarga `videos.db`, o móntala en Google Drive:\n",
+    "```python\n",
+    "from google.colab import drive\n",
+    "drive.mount('/content/drive')\n",
+    "```\n",
+    "y cambia `DB = \"videos.db\"` por una ruta dentro de Drive."
+   ]
+  }
+ ],
+ "metadata": {
+  "accelerator": "GPU",
+  "colab": {
+   "provenance": []
+  },
+  "kernelspec": {
+   "name": "python3",
+   "display_name": "Python 3"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

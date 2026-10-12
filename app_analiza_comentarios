@@ -1,0 +1,286 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Procesamiento de textos de comentarios de productos\n",
+    "1. Crea la base de datos (SQLite) con la tabla de comentarios (producto, likes, dislikes, cliente).\n",
+    "2. Procesa textos de comentarios (sentimiento + estadísticas + palabras clave) y guarda el análisis en la base de datos.\n",
+    "\n",
+    "Ejecuta las celdas en orden. La GPU es opcional."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "!pip -q install gradio transformers"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## a. Base de datos y tabla de comentarios"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import sqlite3\n",
+    "import pandas as pd\n",
+    "\n",
+    "DB = \"comentarios_texto.db\"\n",
+    "\n",
+    "# Datos de ejemplo (producto, likes, dislikes, cliente)\n",
+    "EJEMPLOS = [\n",
+    "    (\"Auriculares Bluetooth X1\", 1, 0, \"Ana Pérez\"),\n",
+    "    (\"Auriculares Bluetooth X1\", 0, 1, \"Luis Gómez\"),\n",
+    "    (\"Licuadora Turbo 500\", 1, 0, \"María López\"),\n",
+    "    (\"Licuadora Turbo 500\", 1, 0, \"Carlos Ruiz\"),\n",
+    "    (\"Zapatillas Runner Pro\", 0, 1, \"Sofía Díaz\"),\n",
+    "    (\"Zapatillas Runner Pro\", 1, 0, \"Jorge Silva\"),\n",
+    "]\n",
+    "\n",
+    "def conectar():\n",
+    "    return sqlite3.connect(DB)\n",
+    "\n",
+    "def crear_tablas():\n",
+    "    with conectar() as con:\n",
+    "        con.execute('''CREATE TABLE IF NOT EXISTS comentarios (\n",
+    "            id INTEGER PRIMARY KEY AUTOINCREMENT,\n",
+    "            producto TEXT NOT NULL,\n",
+    "            likes INTEGER NOT NULL DEFAULT 0,\n",
+    "            dislikes INTEGER NOT NULL DEFAULT 0,\n",
+    "            cliente TEXT NOT NULL)''')\n",
+    "        con.execute('''CREATE TABLE IF NOT EXISTS analisis_textos (\n",
+    "            id INTEGER PRIMARY KEY AUTOINCREMENT,\n",
+    "            comentario_id INTEGER REFERENCES comentarios(id),\n",
+    "            fecha TEXT,\n",
+    "            texto TEXT,\n",
+    "            num_palabras INTEGER,\n",
+    "            num_caracteres INTEGER,\n",
+    "            sentimiento TEXT,\n",
+    "            confianza REAL,\n",
+    "            palabras_clave TEXT)''')\n",
+    "        if con.execute(\"SELECT COUNT(*) FROM comentarios\").fetchone()[0] == 0:\n",
+    "            con.executemany(\"INSERT INTO comentarios (producto, likes, dislikes, cliente) VALUES (?,?,?,?)\", EJEMPLOS)\n",
+    "\n",
+    "crear_tablas()\n",
+    "with conectar() as con:\n",
+    "    display(pd.read_sql_query(\"SELECT * FROM comentarios\", con))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## b. Modelo y procesamiento de textos"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import re, datetime\n",
+    "from collections import Counter\n",
+    "import torch\n",
+    "from transformers import pipeline\n",
+    "\n",
+    "dev_idx = 0 if torch.cuda.is_available() else -1\n",
+    "clasificador = pipeline(\"text-classification\", model=\"cardiffnlp/twitter-xlm-roberta-base-sentiment\", device=dev_idx)\n",
+    "\n",
+    "MAPA = {\"positive\": \"positivo\", \"negative\": \"negativo\", \"neutral\": \"neutro\",\n",
+    "        \"label_0\": \"negativo\", \"label_1\": \"neutro\", \"label_2\": \"positivo\"}\n",
+    "\n",
+    "def clasificar_sentimiento(texto):\n",
+    "    r = clasificador(texto, truncation=True)[0]\n",
+    "    etiqueta = r[\"label\"].lower()\n",
+    "    return MAPA.get(etiqueta, etiqueta), float(r[\"score\"])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "STOPWORDS = set('''de la que el en y a los del se las por un para con no una su al lo como más pero sus le ya o este\n",
+    "sí porque esta entre cuando muy sin sobre también me hasta hay donde quien desde todo nos durante todos uno les ni\n",
+    "contra otros ese eso ante ellos e esto mí antes algunos qué unos yo otro otras otra él tanto esa estos mucho quienes\n",
+    "nada muchos cual poco ella estar estas algunas algo nosotros mi mis tú te ti tu tus es son fue era soy lo he ha han\n",
+    "the and was is it to of for with this that are i my have not but you very'''.split())\n",
+    "\n",
+    "def estadisticas_texto(texto):\n",
+    "    palabras = re.findall(r\"[a-záéíóúñü]+\", texto.lower())\n",
+    "    claves = [p for p in palabras if len(p) > 3 and p not in STOPWORDS]\n",
+    "    top = [p for p, _ in Counter(claves).most_common(5)]\n",
+    "    return len(palabras), len(texto), \", \".join(top)\n",
+    "\n",
+    "def procesar_texto(texto, producto, cliente):\n",
+    "    texto, producto, cliente = (texto or \"\").strip(), (producto or \"\").strip(), (cliente or \"\").strip()\n",
+    "    if not producto or not cliente:\n",
+    "        raise ValueError(\"Indica el producto y el cliente.\")\n",
+    "    if not texto:\n",
+    "        raise ValueError(\"Escribe el comentario.\")\n",
+    "    sentimiento, confianza = clasificar_sentimiento(texto)\n",
+    "    n_pal, n_car, claves = estadisticas_texto(texto)\n",
+    "    like = 1 if sentimiento == \"positivo\" else 0\n",
+    "    dislike = 1 if sentimiento == \"negativo\" else 0\n",
+    "    ahora = datetime.datetime.now().isoformat(timespec=\"seconds\")\n",
+    "    with conectar() as con:\n",
+    "        cur = con.execute(\"INSERT INTO comentarios (producto, likes, dislikes, cliente) VALUES (?,?,?,?)\",\n",
+    "                          (producto, like, dislike, cliente))\n",
+    "        cid = cur.lastrowid\n",
+    "        con.execute(\n",
+    "            \"INSERT INTO analisis_textos (comentario_id, fecha, texto, num_palabras, num_caracteres, \"\n",
+    "            \"sentimiento, confianza, palabras_clave) VALUES (?,?,?,?,?,?,?,?)\",\n",
+    "            (cid, ahora, texto, n_pal, n_car, sentimiento, confianza, claves))\n",
+    "    return (f\"Sentimiento: {sentimiento} ({confianza:.1%}) -> \"\n",
+    "            f\"{'LIKE' if like else 'DISLIKE' if dislike else 'sin like ni dislike'}\\n\"\n",
+    "            f\"Palabras: {n_pal} | Caracteres: {n_car}\\n\"\n",
+    "            f\"Palabras clave: {claves or '(ninguna)'}\\n\"\n",
+    "            f\"Guardado en la base de datos (comentario #{cid}).\")\n",
+    "\n",
+    "MAX_FILAS = 200\n",
+    "\n",
+    "def procesar_csv(ruta):\n",
+    "    df = pd.read_csv(ruta)\n",
+    "    df.columns = [str(c).strip().lower() for c in df.columns]\n",
+    "    col_texto = next((c for c in (\"comentario\", \"texto\", \"text\") if c in df.columns), None)\n",
+    "    if col_texto is None or \"producto\" not in df.columns or \"cliente\" not in df.columns:\n",
+    "        raise ValueError(\"El CSV debe tener las columnas: producto, cliente y comentario.\")\n",
+    "    filas = []\n",
+    "    for _, f in df.head(MAX_FILAS).iterrows():\n",
+    "        if pd.isna(f[col_texto]) or pd.isna(f[\"producto\"]) or pd.isna(f[\"cliente\"]):\n",
+    "            continue\n",
+    "        procesar_texto(str(f[col_texto]), str(f[\"producto\"]), str(f[\"cliente\"]))\n",
+    "        filas.append(f)\n",
+    "    return len(filas), len(df)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Archivo CSV de ejemplo (opcional)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "pd.DataFrame({\n",
+    "    \"producto\": [\"Licuadora Turbo 500\", \"Licuadora Turbo 500\", \"Auriculares Bluetooth X1\", \"Zapatillas Runner Pro\"],\n",
+    "    \"cliente\": [\"Pedro Gómez\", \"Lucía Fernández\", \"Marta Acosta\", \"Diego Romero\"],\n",
+    "    \"comentario\": [\n",
+    "        \"Me encantó, es potente y fácil de limpiar. La recomiendo.\",\n",
+    "        \"Muy mala experiencia, llegó rota y nadie me ayudó.\",\n",
+    "        \"El paquete llegó el martes.\",\n",
+    "        \"Cómodas y livianas, las mejores zapatillas que tuve.\",\n",
+    "    ],\n",
+    "}).to_csv(\"comentarios_ejemplo.csv\", index=False)\n",
+    "print(\"Creado: comentarios_ejemplo.csv (descárgalo del panel de archivos para subirlo en la interfaz)\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## c. Interfaz (Gradio)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import gradio as gr\n",
+    "\n",
+    "def ui_texto(texto, producto, cliente):\n",
+    "    try:\n",
+    "        return procesar_texto(texto, producto, cliente)\n",
+    "    except Exception as e:\n",
+    "        return f\"Error: {e}\"\n",
+    "\n",
+    "def ui_csv(ruta):\n",
+    "    if ruta is None:\n",
+    "        return \"Sube un archivo .csv.\"\n",
+    "    try:\n",
+    "        ok, total = procesar_csv(ruta)\n",
+    "    except Exception as e:\n",
+    "        return f\"Error: {e}\"\n",
+    "    return f\"Comentarios procesados y guardados: {ok} de {total} filas.\"\n",
+    "\n",
+    "def ver_tablas():\n",
+    "    with conectar() as con:\n",
+    "        c = pd.read_sql_query(\"SELECT * FROM comentarios ORDER BY id DESC\", con)\n",
+    "        a = pd.read_sql_query(\"SELECT * FROM analisis_textos ORDER BY id DESC\", con)\n",
+    "        r = pd.read_sql_query('''SELECT producto, COUNT(*) AS comentarios, SUM(likes) AS likes, SUM(dislikes) AS dislikes\n",
+    "                                 FROM comentarios GROUP BY producto ORDER BY comentarios DESC''', con)\n",
+    "    return c, a, r\n",
+    "\n",
+    "with gr.Blocks(title=\"Comentarios de productos en texto\") as demo:\n",
+    "    gr.Markdown(\"# Análisis de comentarios de productos en texto\")\n",
+    "    with gr.Tabs():\n",
+    "        with gr.TabItem(\"Analizar comentario\"):\n",
+    "            producto = gr.Textbox(label=\"Producto\")\n",
+    "            cliente = gr.Textbox(label=\"Cliente\")\n",
+    "            texto = gr.Textbox(label=\"Comentario\", lines=4)\n",
+    "            btn = gr.Button(\"Analizar y guardar\", variant=\"primary\")\n",
+    "            salida = gr.Textbox(label=\"Análisis\", lines=5)\n",
+    "            btn.click(ui_texto, [texto, producto, cliente], salida)\n",
+    "        with gr.TabItem(\"Analizar CSV\"):\n",
+    "            gr.Markdown(\"Sube un **.csv** con las columnas `producto`, `cliente` y `comentario`.\")\n",
+    "            f_in = gr.File(file_types=[\".csv\"], type=\"filepath\", label=\"Archivo CSV\")\n",
+    "            f_btn = gr.Button(\"Procesar archivo\", variant=\"primary\")\n",
+    "            f_out = gr.Textbox(label=\"Resultado\")\n",
+    "            f_btn.click(ui_csv, f_in, f_out)\n",
+    "        with gr.TabItem(\"Base de datos\"):\n",
+    "            b = gr.Button(\"Actualizar tablas\")\n",
+    "            t_c = gr.Dataframe(label=\"Tabla: comentarios\")\n",
+    "            t_a = gr.Dataframe(label=\"Tabla: analisis_textos\")\n",
+    "            t_r = gr.Dataframe(label=\"Resumen por producto\")\n",
+    "            b.click(ver_tablas, None, [t_c, t_a, t_r])\n",
+    "\n",
+    "demo.launch(share=True, debug=True)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Guardar la base de datos\n",
+    "En Colab los archivos se borran al cerrar la sesión. Descarga `comentarios_texto.db`, o móntala en Google Drive:\n",
+    "```python\n",
+    "from google.colab import drive\n",
+    "drive.mount('/content/drive')\n",
+    "```\n",
+    "y cambia `DB = \"comentarios_texto.db\"` por una ruta dentro de Drive."
+   ]
+  }
+ ],
+ "metadata": {
+  "accelerator": "GPU",
+  "colab": {
+   "provenance": []
+  },
+  "kernelspec": {
+   "name": "python3",
+   "display_name": "Python 3"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

@@ -1,0 +1,193 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Generador de imágenes con una GAN (DCGAN)\n",
+    "Antes de ejecutar: **Entorno de ejecución > Cambiar tipo de entorno > GPU (T4)**. Ejecuta las celdas en orden.\n",
+    "El entrenamiento de 20 épocas con MNIST toma unos minutos en GPU."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "!pip -q install gradio"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Datos y modelos"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import torch, torch.nn as nn\n",
+    "import matplotlib.pyplot as plt\n",
+    "from torch.utils.data import DataLoader\n",
+    "from torchvision import datasets, transforms\n",
+    "\n",
+    "device = \"cuda\" if torch.cuda.is_available() else \"cpu\"\n",
+    "print(\"Dispositivo:\", device)\n",
+    "\n",
+    "DATASET = \"MNIST\"      # también puedes usar \"FashionMNIST\"\n",
+    "LATENT = 100           # tamaño del vector aleatorio de entrada\n",
+    "EPOCHS = 20\n",
+    "BATCH = 128\n",
+    "\n",
+    "tfm = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])\n",
+    "data = getattr(datasets, DATASET)(root=\"./data\", train=True, download=True, transform=tfm)\n",
+    "loader = DataLoader(data, batch_size=BATCH, shuffle=True, drop_last=True, num_workers=2)\n",
+    "\n",
+    "class Generator(nn.Module):\n",
+    "    def __init__(self, latent=LATENT):\n",
+    "        super().__init__()\n",
+    "        self.fc = nn.Sequential(nn.Linear(latent, 128 * 7 * 7), nn.BatchNorm1d(128 * 7 * 7), nn.ReLU(True))\n",
+    "        self.net = nn.Sequential(\n",
+    "            nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.BatchNorm2d(64), nn.ReLU(True),\n",
+    "            nn.ConvTranspose2d(64, 1, 4, 2, 1), nn.Tanh())\n",
+    "    def forward(self, z):\n",
+    "        return self.net(self.fc(z).view(-1, 128, 7, 7))\n",
+    "\n",
+    "class Discriminator(nn.Module):\n",
+    "    def __init__(self):\n",
+    "        super().__init__()\n",
+    "        self.net = nn.Sequential(\n",
+    "            nn.Conv2d(1, 64, 4, 2, 1), nn.LeakyReLU(0.2, True),\n",
+    "            nn.Conv2d(64, 128, 4, 2, 1), nn.BatchNorm2d(128), nn.LeakyReLU(0.2, True),\n",
+    "            nn.Flatten(), nn.Linear(128 * 7 * 7, 1))\n",
+    "    def forward(self, x):\n",
+    "        return self.net(x).view(-1)\n",
+    "\n",
+    "def init_w(m):\n",
+    "    n = m.__class__.__name__\n",
+    "    if \"Conv\" in n or \"Linear\" in n:\n",
+    "        nn.init.normal_(m.weight, 0.0, 0.02)\n",
+    "    elif \"BatchNorm\" in n:\n",
+    "        nn.init.normal_(m.weight, 1.0, 0.02)\n",
+    "        nn.init.zeros_(m.bias)\n",
+    "\n",
+    "G, D = Generator().to(device), Discriminator().to(device)\n",
+    "G.apply(init_w); D.apply(init_w)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Entrenamiento"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "loss_fn = nn.BCEWithLogitsLoss()\n",
+    "optG = torch.optim.Adam(G.parameters(), lr=2e-4, betas=(0.5, 0.999))\n",
+    "optD = torch.optim.Adam(D.parameters(), lr=2e-4, betas=(0.5, 0.999))\n",
+    "\n",
+    "for epoch in range(1, EPOCHS + 1):\n",
+    "    for real, _ in loader:\n",
+    "        real = real.to(device)\n",
+    "        b = real.size(0)\n",
+    "        ones = torch.ones(b, device=device)\n",
+    "        zeros = torch.zeros(b, device=device)\n",
+    "\n",
+    "        # Discriminador: distinguir real vs falso\n",
+    "        fake = G(torch.randn(b, LATENT, device=device))\n",
+    "        lossD = loss_fn(D(real), ones) + loss_fn(D(fake.detach()), zeros)\n",
+    "        optD.zero_grad(); lossD.backward(); optD.step()\n",
+    "\n",
+    "        # Generador: engañar al discriminador\n",
+    "        lossG = loss_fn(D(fake), ones)\n",
+    "        optG.zero_grad(); lossG.backward(); optG.step()\n",
+    "\n",
+    "    print(f\"Época {epoch}/{EPOCHS}  pérdida D: {lossD.item():.3f}  pérdida G: {lossG.item():.3f}\")\n",
+    "\n",
+    "torch.save(G.state_dict(), \"generador.pth\")\n",
+    "\n",
+    "# Vista rápida de 16 imágenes generadas\n",
+    "G.eval()\n",
+    "with torch.no_grad():\n",
+    "    muestra = G(torch.randn(16, LATENT, device=device)).cpu()\n",
+    "fig, ejes = plt.subplots(2, 8, figsize=(12, 3))\n",
+    "for img, ax in zip(muestra, ejes.flatten()):\n",
+    "    ax.imshow((img[0] + 1) / 2, cmap=\"gray\"); ax.axis(\"off\")\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Interfaz (Gradio)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import gradio as gr\n",
+    "from PIL import Image\n",
+    "\n",
+    "G.eval()\n",
+    "\n",
+    "def generar_imagenes(n, semilla):\n",
+    "    n = int(n)\n",
+    "    g = torch.Generator().manual_seed(int(semilla)) if semilla is not None and semilla >= 0 else None\n",
+    "    z = torch.randn(n, LATENT, generator=g).to(device)\n",
+    "    with torch.no_grad():\n",
+    "        x = G(z).cpu()\n",
+    "    x = ((x + 1) / 2).clamp(0, 1).mul(255).byte().squeeze(1).numpy()\n",
+    "    return [Image.fromarray(a).resize((168, 168), Image.Resampling.NEAREST) for a in x]\n",
+    "\n",
+    "def info_modelo():\n",
+    "    params = sum(p.numel() for p in G.parameters())\n",
+    "    return (f\"Arquitectura: DCGAN\\nDataset de entrenamiento: {DATASET}\\n\"\n",
+    "            f\"Épocas entrenadas: {EPOCHS}\\nDimensión del vector latente: {LATENT}\\n\"\n",
+    "            f\"Parámetros del generador: {params:,}\\nDispositivo: {device}\")\n",
+    "\n",
+    "with gr.Blocks(title=\"Generador de imágenes con GAN\") as demo:\n",
+    "    gr.Markdown(\"# Generador de imágenes con GAN\")\n",
+    "    with gr.Tabs():\n",
+    "        with gr.TabItem(\"Generar\"):\n",
+    "            n = gr.Slider(1, 25, value=10, step=1, label=\"Cantidad de imágenes\")\n",
+    "            semilla = gr.Number(value=-1, precision=0, label=\"Semilla (-1 = aleatoria)\")\n",
+    "            btn = gr.Button(\"Generar\", variant=\"primary\")\n",
+    "            galeria = gr.Gallery(label=\"Imágenes generadas\", columns=5, height=\"auto\")\n",
+    "            btn.click(generar_imagenes, [n, semilla], galeria)\n",
+    "        with gr.TabItem(\"Información del modelo\"):\n",
+    "            btn_i = gr.Button(\"Ver información\")\n",
+    "            out_i = gr.Textbox(label=\"Detalles\", lines=7)\n",
+    "            btn_i.click(info_modelo, None, out_i)\n",
+    "\n",
+    "demo.launch(share=True, debug=True)"
+   ]
+  }
+ ],
+ "metadata": {
+  "accelerator": "GPU",
+  "colab": {
+   "provenance": []
+  },
+  "kernelspec": {
+   "name": "python3",
+   "display_name": "Python 3"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
